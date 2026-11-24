@@ -123,7 +123,7 @@ export function install(rt) {
     const botId = rt.chatOwners.get(id)
     const activeInfo = entry.info ?? entry.claimed?.find(item => item?.silent !== true)
     if (rt.isHiddenBotWorkTurn?.(botId, activeInfo)) return
-    if (rt.taskOwners?.has(id) || rt.isHandingOff?.(id) || (!checkedHandoff && rt.shouldMoveForeground?.(rt.botOf(botId), id))) return
+    if (rt.taskOwners?.has(id) || rt.isHandingOff?.(id) || (!checkedHandoff && rt.shouldMoveForeground?.(rt.botOf(botId), id, { steer: true }))) return
     if ([...(rt.switchJobs?.() ?? [])].some(job => job?.botId === botId && job.roomId === undefined)) return
     const track = stateOf(id)
     if (track.phase !== 'model' || track.cutting) return
@@ -597,7 +597,7 @@ export function install(rt) {
       }
       case 'agent/inbox/spliced':
         if (isUserSteer(event)) {
-          if (rt.taskOwners?.has(id) || rt.shouldMoveForeground?.(rt.botOf(rt.chatOwners.get(id)), id)) break
+          if (rt.taskOwners?.has(id) || rt.shouldMoveForeground?.(rt.botOf(rt.chatOwners.get(id)), id, { steer: true })) break
           wake(track.steerWaiters, true)
           scheduleCut(id, true)
         }

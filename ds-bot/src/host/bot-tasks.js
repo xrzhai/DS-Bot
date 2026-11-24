@@ -838,7 +838,9 @@ export function install(rt) {
   // Determines whether a Bot's foreground chat is busy enough to move its running turn
   // intact into `bot.tasks[]` (or spawn a peer-Bot background task) rather than doing
   // a fast mid-model steer cut. Disabled for local CLI agents in v1.
-  function shouldMoveForeground(bot, sessionId, { forPeer = false } = {}) {
+  // `steer` marks a message the user sent as a steer (busy Enter set to Steer, or the
+  // reverse chord under Queue): it goes into the running turn instead of moving it (#2077).
+  function shouldMoveForeground(bot, sessionId, { forPeer = false, steer = false } = {}) {
     if (bot === undefined || sessionId === undefined || rt.readOnly?.() !== undefined) return false
     if (sessionId !== rt.chatOf(bot.id)) return false
     if (rt.groupOwners.has(sessionId) || rt.taskOwners?.has(sessionId)) return false
@@ -851,6 +853,7 @@ export function install(rt) {
     // A hidden peer-Bot work turn on foreground must hand off immediately on user input
     // instead of falling through to steer.js STEER_CUT (which would leak the user's reply).
     if (!forPeer && rt.isHiddenBotWorkTurn?.(bot.id, activeTurnInfo(entry))) return true
+    if (steer) return false
     if ((entry.toolCount ?? 0) > 0 || (entry.calls?.size ?? 0) > 0) return true
     if ((rt.runningJobs?.(sessionId)?.length ?? 0) > 0) return true
     const waitMs = rt.backgroundWaitMs?.() ?? 5000
@@ -1387,7 +1390,7 @@ export function install(rt) {
           await clearPendingTransfers(pulled.map(item => item.transferId))
           return
         }
-        if (shouldMoveForeground(ownerBot, fgSid)) {
+        if (shouldMoveForeground(ownerBot, fgSid, { steer: target === 'next-step' })) {
           const fgAgent = ctx.get('agents')?.get(fgSid)
           const rebased = pulled.map(item => ({ ...item, oldAgent: fgAgent }))
           fgSid = await handoffForeground(ownerBot, fgSid, rebased)
@@ -1402,7 +1405,7 @@ export function install(rt) {
     // synchronously in FIFO order and move the busy turn intact into `bot.tasks[]`.
     const botId = rt.chatOwners.get(id)
     const bot = botId === undefined ? undefined : rt.botOf(botId)
-    if (!shouldMoveForeground(bot, id)) {
+    if (!shouldMoveForeground(bot, id, { steer: target === 'next-step' })) {
       // When foreground handoff is unavailable (e.g. local CLI Bot) while a hidden
       // peer-Bot turn is running, demote user `next-step` steers to `next-turn` so the
       // user's message never injects into or leaks out of the hidden peer-Bot turn.

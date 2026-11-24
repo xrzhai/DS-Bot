@@ -227,7 +227,7 @@ async function createRealLoopRig(t, { prefs = {}, failForkAndCreate = false, hol
   return { home, root, rootWarnings, rt, agents, toolStarted, toolGate, firstModelStarted, firstModelGate, forkStarted, forkGate, repliesBySession, modelCallsBySession }
 }
 
-test('real DSH SessionStore + ReactLoopAgent: Desktop steer while busy hands off foreground without reentrancy error', async (t) => {
+test('real DSH SessionStore + ReactLoopAgent: Desktop queued message while busy hands off foreground without reentrancy error', async (t) => {
   const rig = await createRealLoopRig(t)
   const dmA = rig.agents.get('dm-a')
 
@@ -236,9 +236,9 @@ test('real DSH SessionStore + ReactLoopAgent: Desktop steer while busy hands off
   await rig.toolStarted.promise
   assert.equal(rig.rt.shouldMoveForeground(rig.rt.botOf('a'), 'dm-a'), true)
 
-  // Desktop/Web composer sends a message directly through ReactLoopAgent.steer()
-  // (exact path of dsh-api-session-controller.prompt with mode='steer').
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'What are you doing?' }], source: { kind: 'user' } }))
+  // Desktop/Web composer sends a message directly through ReactLoopAgent.followup()
+  // (exact path of dsh-api-session-controller.prompt with mode='queue').
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'What are you doing?' }], source: { kind: 'user' } }))
 
   // Must NOT hit DSH Session.append() reentrancy guard, and must pull the message
   // out of dm-a's inbox immediately (never left stuck as "unread").
@@ -247,7 +247,7 @@ test('real DSH SessionStore + ReactLoopAgent: Desktop steer while busy hands off
     false,
     `must not trigger DSH Session.append reentrancy error; warnings=${JSON.stringify(rig.rootWarnings)}`,
   )
-  assert.equal(dmA.inbox.nextStep.length, 0, 'message must be pulled from busy foreground inbox, not left unread')
+  assert.equal(dmA.inbox.nextTurn.length, 0, 'message must be pulled from busy foreground inbox, not left unread')
 
   // New foreground session forks and answers the new message immediately while dm-a keeps running in background.
   await settle(() => {
@@ -271,21 +271,45 @@ test('real DSH SessionStore + ReactLoopAgent: Desktop steer while busy hands off
   }, 5000, 'background task did not settle and report back to new foreground')
 })
 
-test('real DSH SessionStore + ReactLoopAgent: post-handoff polling gap redirects stale steer without reentrancy error', async (t) => {
+test('real DSH SessionStore + ReactLoopAgent: #2077 Desktop steer while busy stays in the running turn', async (t) => {
+  const rig = await createRealLoopRig(t)
+  const dmA = rig.agents.get('dm-a')
+
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Please run slow work' }], source: { kind: 'user' } }))
+  await rig.toolStarted.promise
+  assert.equal(rig.rt.shouldMoveForeground(rig.rt.botOf('a'), 'dm-a'), true)
+
+  // Busy Enter set to Steer: the composer prompts with mode='steer' (ReactLoopAgent.steer()).
+  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Only the unit tests, please' }], source: { kind: 'user' } }))
+  assert.equal(rig.rootWarnings.some(line => line.includes('reenter')), false)
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(rig.rt.botOf('a').sessionId, 'dm-a', 'foreground must not fork')
+  assert.equal(rig.rt.botOf('a').tasks?.length ?? 0, 0, 'no fg-handoff task')
+
+  rig.toolGate.resolve()
+  const tookSteer = () => (dmA.session?.snapshotEvents?.() ?? [])
+    .some(ev => ev.type === 'user/message' && JSON.stringify(ev.data ?? {}).includes('Only the unit tests, please'))
+  await settle(() => tookSteer() && (rig.modelCallsBySession.get('dm-a') ?? 0) >= 2, 5000, 'the running turn did not take the steer')
+  assert.equal(dmA.inbox.nextStep.length, 0)
+  assert.equal(rig.rt.botOf('a').sessionId, 'dm-a')
+  assert.equal(rig.rt.botOf('a').tasks?.length ?? 0, 0)
+})
+
+test('real DSH SessionStore + ReactLoopAgent: post-handoff polling gap redirects stale queued message without reentrancy error', async (t) => {
   const rig = await createRealLoopRig(t)
   const dmA = rig.agents.get('dm-a')
 
   dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Please run slow work' }], source: { kind: 'user' } }))
   await rig.toolStarted.promise
 
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'First foreground message' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'First foreground message' }], source: { kind: 'user' } }))
   await settle(() => rig.rt.botOf('a').sessionId !== 'dm-a', 5000, 'handoff did not commit')
   const fgSid = rig.rt.botOf('a').sessionId
 
   // Simulate Desktop tab still pointing at stale dm-a (now in taskOwners) before roster poll updates.
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Stale tab message' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Stale tab message' }], source: { kind: 'user' } }))
   assert.equal(rig.rootWarnings.some(line => line.includes('reenter')), false)
-  assert.equal(dmA.inbox.nextStep.length, 0, 'stale message must be pulled from background task inbox')
+  assert.equal(dmA.inbox.nextTurn.length, 0, 'stale message must be pulled from background task inbox')
 
   await settle(
     () => (rig.repliesBySession.get(fgSid) ?? []).some(r => r.includes('Stale tab message')),
@@ -294,17 +318,17 @@ test('real DSH SessionStore + ReactLoopAgent: post-handoff polling gap redirects
   )
 })
 
-test('real DSH SessionStore + ReactLoopAgent: backgroundAfterSec=0 double steer forwards both without self-handoff', async (t) => {
+test('real DSH SessionStore + ReactLoopAgent: backgroundAfterSec=0 double queued message forwards both without self-handoff', async (t) => {
   const rig = await createRealLoopRig(t, { prefs: { backgroundAfterSec: 0 } })
   const dmA = rig.agents.get('dm-a')
 
   dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Please run slow work' }], source: { kind: 'user' } }))
   await rig.toolStarted.promise
 
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Rapid one' }], source: { kind: 'user' } }))
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Rapid two' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Rapid one' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Rapid two' }], source: { kind: 'user' } }))
   assert.equal(rig.rootWarnings.some(line => line.includes('reenter')), false)
-  assert.equal(dmA.inbox.nextStep.length, 0)
+  assert.equal(dmA.inbox.nextTurn.length, 0)
 
   await settle(() => {
     const fgSid = rig.rt.botOf('a').sessionId
@@ -317,17 +341,17 @@ test('real DSH SessionStore + ReactLoopAgent: backgroundAfterSec=0 double steer 
   assert.equal(rig.rt.botOf('a').tasks.length, 1, 'forwarding a 2-message batch at backgroundAfterSec=0 must not trigger a second spurious handoff')
 })
 
-test('real DSH SessionStore + ReactLoopAgent: failed pre-commit fork restores pulled steer without loop or reentrancy error', async (t) => {
+test('real DSH SessionStore + ReactLoopAgent: failed pre-commit fork restores pulled message without loop or reentrancy error', async (t) => {
   const rig = await createRealLoopRig(t, { failForkAndCreate: true })
   const dmA = rig.agents.get('dm-a')
 
   dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Please run slow work' }], source: { kind: 'user' } }))
   await rig.toolStarted.promise
 
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Keep me on failure' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Keep me on failure' }], source: { kind: 'user' } }))
   assert.equal(rig.rootWarnings.some(line => line.includes('reenter')), false)
 
-  await settle(() => dmA.inbox.nextStep.some(m => textOf(m).includes('Keep me on failure')), 3000, 'pulled message must be restored on pre-commit failure')
+  await settle(() => dmA.inbox.nextTurn.some(m => textOf(m).includes('Keep me on failure')), 3000, 'pulled message must be restored on pre-commit failure')
   assert.equal(rig.rt.botOf('a').sessionId, 'dm-a')
   assert.equal(rig.rt.botOf('a').tasks?.length ?? 0, 0)
 })
@@ -418,7 +442,7 @@ test('real DSH SessionStore + ReactLoopAgent: handoff transfers earlier queued u
 
   // Cross threshold and send a new prompt that triggers foreground handoff.
   rig.rt.live.get('dm-a').since = Date.now() - 31_000
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Trigger handoff prompt' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Trigger handoff prompt' }], source: { kind: 'user' } }))
 
   await settle(() => {
     const fgSid = rig.rt.botOf('a').sessionId
@@ -467,13 +491,13 @@ test('real DSH SessionStore + ReactLoopAgent: durable pendingHandoffInputs repla
   assert.equal(rig.rt.state.pendingHandoffInputs, undefined, 'cleared pendingHandoffInputs must be removed from state')
 })
 
-test('real DSH SessionStore + ReactLoopAgent: polling-gap steer on an idle active taskOwners session rejects empty wake and resists concurrent reconcileTasksAfterRestart', async (t) => {
+test('real DSH SessionStore + ReactLoopAgent: polling-gap message on an idle active taskOwners session rejects empty wake and resists concurrent reconcileTasksAfterRestart', async (t) => {
   const rig = await createRealLoopRig(t)
   const dmA = rig.agents.get('dm-a')
 
   dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Please run slow work' }], source: { kind: 'user' } }))
   await rig.toolStarted.promise
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Move to background' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Move to background' }], source: { kind: 'user' } }))
   await settle(() => rig.rt.botOf('a').sessionId !== 'dm-a'
     && (rig.repliesBySession.get(rig.rt.botOf('a').sessionId) ?? []).some(r => r.includes('Move to background')), 5000)
   const fgSid = rig.rt.botOf('a').sessionId
@@ -489,7 +513,7 @@ test('real DSH SessionStore + ReactLoopAgent: polling-gap steer on an idle activ
 
   // Stale Desktop tab sends a prompt to the idle `taskOwners` session while startup
   // `reconcileTasksAfterRestart()` also fires concurrently (must NOT duplicate!).
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Late stale tab prompt' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Late stale tab prompt' }], source: { kind: 'user' } }))
   const reconcilePromise = rig.rt.reconcileTasksAfterRestart()
 
   await settle(
@@ -517,7 +541,7 @@ test('real DSH SessionStore + ReactLoopAgent: startup reconcile waits for an in-
   // Start a busy turn and trigger a brand-new live handoff paused in `fork()`.
   dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Please run slow work' }], source: { kind: 'user' } }))
   await rig.toolStarted.promise
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'Check the budget' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'Check the budget' }], source: { kind: 'user' } }))
   await rig.forkStarted.promise
   assert.equal(rig.rt.isHandingOff('dm-a'), true, 'live handoff must be in flight when startup reconcile runs')
 
@@ -602,7 +626,7 @@ test('real DSH SessionStore + ReactLoopAgent: startup reconcile deduplicates a s
   await rig.toolStarted.promise
 
   // A follow-up user message moves dm-a (still running rpc-already-running-1) into background.
-  dmA.steer(createUserMessage({ content: [{ type: 'text', text: 'New foreground question' }], source: { kind: 'user' } }))
+  dmA.followup(createUserMessage({ content: [{ type: 'text', text: 'New foreground question' }], source: { kind: 'user' } }))
   await rig.forkStarted.promise
 
   rig.rt.state.pendingHandoffInputs = [

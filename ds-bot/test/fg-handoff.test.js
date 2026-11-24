@@ -208,14 +208,14 @@ test('Desktop/Web user message on busy foreground moves old Session intact into 
 
   // User hits Enter in Desktop/Web composer -> spliced into dm-a inbox.
   const userMsg = { id: 'u-new-1', role: 'user', content: [{ type: 'text', text: 'By the way, how is the release going?' }], source: { kind: 'user' } }
-  dmA.inbox.nextStep.push(userMsg)
-  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [userMsg] })
+  dmA.inbox.nextTurn.push(userMsg)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-turn', inserted: [userMsg] })
   await waitFor(() => env.rt.botOf('a').sessionId !== 'dm-a' && env.agentMap.get(env.rt.botOf('a').sessionId)?.followups.length === 1)
 
   const botA = env.rt.botOf('a')
   assert.equal(botA.sessionId, 'fork-1', 'foreground must move to the forked Session')
   assert.equal(dmA.cancelled.length, 0, 'busy foreground turn must NOT be cancelled or steer-cut')
-  assert.equal(dmA.inbox.nextStep.length, 0, 'user message must be pulled synchronously out of old inbox')
+  assert.equal(dmA.inbox.nextTurn.length, 0, 'user message must be pulled synchronously out of old inbox')
   assert.equal(botA.tasks.length, 1)
   assert.equal(botA.tasks[0].sessionId, 'dm-a')
   assert.equal(botA.tasks[0].origin, 'fg-handoff')
@@ -238,6 +238,32 @@ test('Desktop/Web user message on busy foreground moves old Session intact into 
   const report = env.deliveries.find(d => d.role === 'task-report')
   assert.equal(report.sessionId, 'fork-1')
   assert.match(report.text, /Suite passed 100%/)
+})
+
+test('#2077: a Desktop/Web steer on a busy foreground stays in the running turn instead of handing off', async (t) => {
+  const env = await startEnv()
+  t.after(env.stop)
+  const dmA = env.agentMap.get('dm-a')
+  dmA.status = 'running'
+
+  await env.emit('dm-a', 'turn/start', { turn: 1 })
+  await env.emit('dm-a', 'user/message', { content: [{ type: 'text', text: 'Run full integration suite' }], source: { kind: 'user' } })
+  await env.emit('dm-a', 'tool/call', { callId: 'tc1', name: 'bash', arguments: '{"command":"npm test"}' })
+
+  const botA = env.rt.botOf('a')
+  assert.equal(env.rt.shouldMoveForeground(botA, 'dm-a'), true, 'a queued message would still hand off')
+  assert.equal(env.rt.shouldMoveForeground(botA, 'dm-a', { steer: true }), false, 'a steer does not')
+
+  // Busy Enter set to Steer (or the reverse chord under Queue) lands in next-step.
+  const userMsg = { id: 'u-steer-1', role: 'user', content: [{ type: 'text', text: 'Only run the unit tests' }], source: { kind: 'user' } }
+  dmA.inbox.nextStep.push(userMsg)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [userMsg] })
+  await new Promise(resolve => setTimeout(resolve, 50))
+
+  assert.equal(botA.sessionId, 'dm-a', 'foreground must not move')
+  assert.equal(botA.tasks?.length ?? 0, 0, 'no fg-handoff task')
+  assert.equal(env.forkedCalls.length, 0, 'no fork')
+  assert.deepEqual(dmA.inbox.nextStep.map(m => m.id), ['u-steer-1'], 'the steer stays queued for the running turn')
 })
 
 test('Mobile/IM sendUser triggers foreground handoff after wait threshold and redirects stale sessionId', async (t) => {
@@ -361,10 +387,10 @@ test('rapid double Desktop messages share one handoff and post-commit race settl
 
   const m1 = { id: 'u1', role: 'user', content: [{ type: 'text', text: 'First msg' }], source: { kind: 'user' } }
   const m2 = { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Second msg' }], source: { kind: 'user' } }
-  dmA.inbox.nextStep.push(m1)
-  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [m1] })
-  dmA.inbox.nextStep.push(m2)
-  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [m2] })
+  dmA.inbox.nextTurn.push(m1)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-turn', inserted: [m1] })
+  dmA.inbox.nextTurn.push(m2)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-turn', inserted: [m2] })
 
   // Old turn finishes while fork is still awaiting!
   dmA.status = 'idle'
@@ -458,9 +484,9 @@ test('P0 #4: sendUser initiating handoff drains concurrent Desktop spliced messa
 
   // Before fork resolves, Desktop user also sends a message to dm-a.
   const desktopMsg = { id: 'desk-1', role: 'user', content: [{ type: 'text', text: 'From desktop concurrently' }], source: { kind: 'user' } }
-  dmA.inbox.nextStep.push(desktopMsg)
-  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [desktopMsg] })
-  assert.equal(dmA.inbox.nextStep.length, 0, 'Desktop message must be pulled from busy inbox')
+  dmA.inbox.nextTurn.push(desktopMsg)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-turn', inserted: [desktopMsg] })
+  assert.equal(dmA.inbox.nextTurn.length, 0, 'Desktop message must be pulled from busy inbox')
 
   await waitFor(() => typeof releaseFork === 'function')
   releaseFork()
@@ -503,13 +529,13 @@ test('P0 #5: failed pre-commit fork restores pulled message with wakeup=true wit
   await env.emit('dm-a', 'tool/call', { callId: 'tc1', name: 'bash', arguments: '{}' })
 
   const msg = { id: 'u-restore-1', role: 'user', content: [{ type: 'text', text: 'Do not lose me' }], source: { kind: 'user' } }
-  dmA.inbox.nextStep.push(msg)
-  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [msg] })
+  dmA.inbox.nextTurn.push(msg)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-turn', inserted: [msg] })
   await waitFor(() => sendCalls.length > 0)
 
   assert.equal(sendCalls.length, 1, 'restored message must be sent back exactly once with no re-interception loop')
   assert.equal(sendCalls[0].wakeup, true, 'restored message must pass wakeup=true so an idle Agent still wakes')
-  assert.equal(dmA.inbox.nextStep.length, 1)
+  assert.equal(dmA.inbox.nextTurn.length, 1)
   assert.equal(env.rt.botOf('a').sessionId, 'dm-a')
 })
 
@@ -526,11 +552,11 @@ test('P0 #6: post-handoff polling gap redirects stale Desktop message from backg
 
   // Desktop tab hasn't polled roster yet and sends a user message to stale dm-a (now in taskOwners).
   const staleMsg = { id: 'u-stale-1', role: 'user', content: [{ type: 'text', text: 'Sent during polling gap' }], source: { kind: 'user' } }
-  dmA.inbox.nextStep.push(staleMsg)
-  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [staleMsg] })
+  dmA.inbox.nextTurn.push(staleMsg)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-turn', inserted: [staleMsg] })
   await waitFor(() => env.agentMap.get('fork-1')?.followups.some(m => m.content?.[0]?.text === 'Sent during polling gap'))
 
-  assert.equal(dmA.inbox.nextStep.length, 0, 'message must be removed from background task inbox')
+  assert.equal(dmA.inbox.nextTurn.length, 0, 'message must be removed from background task inbox')
   assert.ok(env.agentMap.get('fork-1').followups.some(m => m.content?.[0]?.text === 'Sent during polling gap'))
 })
 
@@ -741,8 +767,8 @@ test('forwardPulledMessages retries transient resolveAgent failure without dropp
   await env.emit('dm-a', 'tool/call', { callId: 'tc1', name: 'bash', arguments: '{}' })
 
   const msg = { id: 'u-retry-1', role: 'user', content: [{ type: 'text', text: 'Survive transient error' }], source: { kind: 'user' } }
-  dmA.inbox.nextStep.push(msg)
-  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-step', inserted: [msg] })
+  dmA.inbox.nextTurn.push(msg)
+  await env.emit('dm-a', 'agent/inbox/spliced', { target: 'next-turn', inserted: [msg] })
   await waitFor(() => env.agentMap.get('fork-1')?.followups.some(m => m.content?.[0]?.text === 'Survive transient error'))
 
   const delivered = env.agentMap.get('fork-1').followups.filter(m => m.content?.[0]?.text === 'Survive transient error')
